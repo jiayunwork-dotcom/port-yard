@@ -155,7 +155,7 @@ class RelocationPlanner:
     ) -> int:
         target_slot = yard.find_container(container)
         if not target_slot:
-            return -1
+            return 0
 
         containers_above = yard.get_containers_above(target_slot)
         return len(containers_above)

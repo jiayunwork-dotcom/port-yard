@@ -72,7 +72,7 @@ class KPICalculator:
         kpi.avg_rtg_efficiency = total_rtg_efficiency / rtg_count if rtg_count > 0 else 0
 
         days = self.sim_duration / 1440.0
-        kpi.total_throughput = stats.total_containers_stowed
+        kpi.total_throughput = stats.total_containers_stowed + stats.total_containers_picked
         kpi.daily_throughput = kpi.total_throughput / days if days > 0 else 0
         kpi.total_containers_stowed = stats.total_containers_stowed
         kpi.total_containers_picked = stats.total_containers_picked
