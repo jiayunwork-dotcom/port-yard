@@ -216,6 +216,10 @@ def main():
         st.session_state.replay_speed = 1
     if "replay_zone" not in st.session_state:
         st.session_state.replay_zone = ZoneType.IMPORT
+    if "replay_jump_zone" not in st.session_state:
+        st.session_state.replay_jump_zone = None
+    if "replay_jump_frame" not in st.session_state:
+        st.session_state.replay_jump_frame = None
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📊 仿真运行", "🏗️ 堆场可视化", "📈 KPI分析", "🔄 策略对比", "🎛️ 参数优化",
@@ -655,6 +659,20 @@ def main():
             with ev_col4:
                 st.metric("📸 快照总数", len(snapshots))
 
+            zone_options = [
+                ("进口区", ZoneType.IMPORT),
+                ("出口区", ZoneType.EXPORT),
+                ("中转区", ZoneType.TRANSIT),
+            ]
+            top_zone = st.selectbox(
+                "📍 当前查看分区 (影响下方热力图与动画)",
+                zone_options,
+                format_func=lambda x: x[0],
+                key="replay_zone_top_select",
+                index=0,
+            )
+            current_zone = top_zone[1]
+
             st.markdown("---")
 
             st.subheader("📈 利用率与排队趋势")
@@ -674,7 +692,7 @@ def main():
             st.plotly_chart(fig_timeline, use_container_width=True)
 
             if events:
-                st.caption("💡 提示: 下表中点击「跳转到此事件」可将回放器定位到事件起始时刻")
+                st.caption("💡 点击下方按钮可跳转动画到对应事件起始时刻。")
                 event_rows = []
                 for idx, e in enumerate(events):
                     icon_map = {
@@ -706,14 +724,21 @@ def main():
                     })
                 st.table(event_rows)
 
-                jump_cols = st.columns(min(5, len(events)))
+                max_jump_buttons = min(8, len(events))
+                jump_cols = st.columns(max_jump_buttons)
                 for i, col in enumerate(jump_cols):
                     if i < len(events):
                         with col:
+                            icon_map = {
+                                BottleneckType.CONGESTION: "🔴",
+                                BottleneckType.RTG_CONFLICT: "🟠",
+                                BottleneckType.GATE_SATURATION: "🟡",
+                            }
                             jump_btn = st.button(
-                                f"⏩ 事件{i+1}: {_format_time(events[i].start_time)}",
+                                f"{icon_map.get(events[i].event_type, '⚪')} 跳至事件{i+1}",
                                 key=f"jump_event_{i}",
                                 use_container_width=True,
+                                help=f"起始: {_format_time(events[i].start_time)} | {events[i].description}",
                             )
                             if jump_btn:
                                 target_time = events[i].start_time
@@ -724,30 +749,18 @@ def main():
                                     if diff < min_diff:
                                         min_diff = diff
                                         closest_idx = j
-                                st.session_state.replay_current_frame = closest_idx
+                                st.session_state.replay_jump_frame = closest_idx
+                                st.session_state.replay_jump_zone = events[i].zone if events[i].zone else current_zone
+                                st.rerun()
 
             st.markdown("---")
-            st.subheader("🎞️ 热力回放器")
+            st.subheader("🎞️ Plotly 动画热力回放器")
 
-            ctrl_col1, ctrl_col2 = st.columns([1, 2])
-            with ctrl_col1:
-                zone_options = [
-                    ("进口区", ZoneType.IMPORT),
-                    ("出口区", ZoneType.EXPORT),
-                    ("中转区", ZoneType.TRANSIT),
-                ]
-                selected_zone = st.selectbox(
-                    "选择回放分区",
-                    zone_options,
-                    format_func=lambda x: x[0],
-                    key="replay_zone_select",
-                    index=0,
-                )
-                current_zone = selected_zone[1]
-            with ctrl_col2:
+            speed_col1, speed_col2, speed_col3 = st.columns([1, 2, 1])
+            with speed_col2:
                 speed_options = [1, 2, 5, 10]
                 selected_speed = st.select_slider(
-                    "播放速度",
+                    "🎚️ 播放速度 (1x=正常, 10x=最快)",
                     options=speed_options,
                     value=st.session_state.replay_speed,
                     format_func=lambda x: f"{x}x",
@@ -755,101 +768,89 @@ def main():
                 )
                 st.session_state.replay_speed = selected_speed
 
+            start_frame_idx = 0
+            if st.session_state.replay_jump_frame is not None:
+                start_frame_idx = max(0, min(st.session_state.replay_jump_frame, len(snapshots) - 1))
+                anim_zone = st.session_state.replay_jump_zone if st.session_state.replay_jump_zone else current_zone
+            else:
+                anim_zone = current_zone
+
             if not snapshots:
                 st.warning("⚠️ 没有可用的快照数据，请确认采样间隔设置。")
             else:
-                max_frame = len(snapshots) - 1
-                current_frame = st.session_state.replay_current_frame
-                current_frame = max(0, min(current_frame, max_frame))
-                st.session_state.replay_current_frame = current_frame
+                with st.spinner("🎬 正在生成 Plotly 动画帧（帧数较多时请稍候）..."):
+                    total_duration = config["simulation"]["duration"]
+                    fig_anim = replay_vis.create_heatmap_animation(
+                        snapshots=snapshots,
+                        zone=anim_zone,
+                        bottleneck_events=events,
+                        playback_speed=selected_speed,
+                        total_duration=total_duration,
+                        start_frame=start_frame_idx,
+                    )
 
-                btn_col1, btn_col2, btn_col3, btn_col4, btn_col5 = st.columns(5)
-                with btn_col1:
-                    first_btn = st.button("⏮️ 第一帧", use_container_width=True)
-                with btn_col2:
-                    prev_btn = st.button("◀️ 上一帧", use_container_width=True)
-                with btn_col3:
-                    play_label = "⏸️ 暂停" if st.session_state.replay_playing else "▶️ 播放"
-                    play_btn = st.button(play_label, type="primary", use_container_width=True)
-                with btn_col4:
-                    next_btn = st.button("▶️ 下一帧", use_container_width=True)
-                with btn_col5:
-                    last_btn = st.button("⏭️ 最后一帧", use_container_width=True)
+                zone_cn = {"import": "进口区", "export": "出口区", "transit": "中转区"}.get(anim_zone.value, anim_zone.value)
+                st.info(f"📍 **当前回放分区**: {zone_cn}  |  **起始帧**: 第{start_frame_idx}帧 ({_format_time(snapshots[start_frame_idx].timestamp) if start_frame_idx < len(snapshots) else '-'})")
 
-                if first_btn:
-                    st.session_state.replay_current_frame = 0
-                    st.session_state.replay_playing = False
-                    st.rerun()
-                if prev_btn and current_frame > 0:
-                    st.session_state.replay_current_frame = current_frame - 1
-                    st.session_state.replay_playing = False
-                    st.rerun()
-                if play_btn:
-                    st.session_state.replay_playing = not st.session_state.replay_playing
-                    st.rerun()
-                if next_btn and current_frame < max_frame:
-                    st.session_state.replay_current_frame = current_frame + 1
-                    st.session_state.replay_playing = False
-                    st.rerun()
-                if last_btn:
-                    st.session_state.replay_current_frame = max_frame
-                    st.session_state.replay_playing = False
-                    st.rerun()
+                st.plotly_chart(fig_anim, use_container_width=True)
 
-                frame = st.slider(
-                    "⏱️ 时间轴进度 (拖动到任意时刻)",
-                    min_value=0,
-                    max_value=max_frame,
-                    value=current_frame,
-                    key="replay_frame_slider",
+                st.success(
+                    "💡 **动画使用说明**:\n"
+                    "1. 点击下方按钮组中的 **▶ 播放** 开始连续播放，**⏸ 暂停** 停止；\n"
+                    "2. **⏮ 第一帧 / ◀ 上一帧 / ▶ 下一帧 / ⏭ 最后一帧** 可逐帧控制；\n"
+                    "3. 拖动底部 **时间轴滑块** 可跳转到任意时刻，滑块每个刻度的前缀图标表示该时刻状态：\n"
+                    "   - 🔴 = 拥堵  🟠 = 场桥冲突  🟡 = 闸口饱和预警  ⬜ = 正常；\n"
+                    "4. 动画中的场桥符号：⚪ 空闲 / 💎 作业中 / ❌ 等待让路；\n"
+                    "5. 左上角徽章会显示当前时刻正在发生的瓶颈事件。"
                 )
-                if frame != st.session_state.replay_current_frame:
-                    st.session_state.replay_current_frame = frame
-                    st.session_state.replay_playing = False
-                    st.rerun()
 
-                snap = snapshots[st.session_state.replay_current_frame]
+                detail_col1, detail_col2 = st.columns(2)
+                with detail_col1:
+                    with st.expander(f"📋 {zone_cn} 场桥状态总览", expanded=False):
+                        zone_rtgs_all = []
+                        for snap in snapshots:
+                            rtgs = snap.rtg_snapshots.get(anim_zone, [])
+                            for r in rtgs:
+                                if r.rtg_id not in [x["rtg_id"] for x in zone_rtgs_all]:
+                                    zone_rtgs_all.append({
+                                        "rtg_id": r.rtg_id,
+                                        "statuses": set(),
+                                    })
+                        if zone_rtgs_all:
+                            summary_rows = []
+                            for r_info in zone_rtgs_all:
+                                rid = r_info["rtg_id"]
+                                statuses = set()
+                                for snap in snapshots:
+                                    for r in snap.rtg_snapshots.get(anim_zone, []):
+                                        if r.rtg_id == rid:
+                                            statuses.add(r.status.value)
+                                status_cn_map = {"idle": "空闲", "working": "作业中", "waiting": "等待让路"}
+                                status_str = "、".join(status_cn_map[s] for s in statuses)
+                                summary_rows.append({
+                                    "场桥ID": rid,
+                                    "出现过的状态": status_str,
+                                })
+                            st.table(summary_rows)
+                        else:
+                            st.info("该区暂无场桥。")
 
-                stat_c1, stat_c2, stat_c3, stat_c4 = st.columns(4)
-                with stat_c1:
-                    st.metric("当前时刻", _format_time(snap.timestamp))
-                with stat_c2:
-                    util = snap.zone_utilization.get(current_zone, 0.0)
-                    st.metric("分区利用率", f"{util:.1%}")
-                with stat_c3:
-                    zone_rtgs = snap.rtg_snapshots.get(current_zone, [])
-                    working_rtgs = len([r for r in zone_rtgs if r.status.value == "working"])
-                    st.metric("作业中场桥", f"{working_rtgs}/{len(zone_rtgs)}")
-                with stat_c4:
-                    st.metric("闸口排队", f"{snap.gate_queue_total} 辆")
-
-                fig_heatmap = replay_vis.create_static_heatmap_frame(snap, current_zone)
-                st.plotly_chart(fig_heatmap, use_container_width=True)
-
-                zone_cn = {"import": "进口区", "export": "出口区", "transit": "中转区"}.get(current_zone.value, current_zone.value)
-                with st.expander(f"📋 {zone_cn} 场桥详情", expanded=False):
-                    if zone_rtgs:
-                        rtg_rows = []
-                        for r in zone_rtgs:
-                            status_cn = {"idle": "空闲", "working": "作业中", "waiting": "等待让路"}[r.status.value]
-                            rtg_rows.append({
-                                "场桥ID": r.rtg_id,
-                                "当前贝位": f"Bay {r.current_bay}",
-                                "状态": status_cn,
-                            })
-                        st.table(rtg_rows)
-                    else:
-                        st.info("该区暂无场桥。")
-
-                with st.expander(f"🚦 各闸口排队详情", expanded=False):
-                    if snap.gate_queue_per_gate:
-                        gate_rows = []
-                        for gid, qlen in snap.gate_queue_per_gate.items():
-                            gate_rows.append({
-                                "闸口": gid.replace("gate_", "闸口 "),
-                                "排队车辆": qlen,
-                            })
-                        st.table(gate_rows)
+                with detail_col2:
+                    with st.expander("🚦 各闸口排队详情（首末帧对比）", expanded=False):
+                        if snapshots:
+                            first = snapshots[0]
+                            last = snapshots[-1]
+                            gate_rows = []
+                            for gid in first.gate_queue_per_gate.keys():
+                                q0 = first.gate_queue_per_gate.get(gid, 0)
+                                q1 = last.gate_queue_per_gate.get(gid, 0)
+                                gate_rows.append({
+                                    "闸口": gid.replace("gate_", "闸口 "),
+                                    "首帧排队": q0,
+                                    "末帧排队": q1,
+                                    "变化": f"{'↑' if q1 > q0 else '↓' if q1 < q0 else '→'} {abs(q1 - q0)}",
+                                })
+                            st.table(gate_rows)
 
                 st.markdown("---")
 

@@ -358,8 +358,22 @@ class ReplayVisualizer:
             "#e74c3c", "#f39c12", "#9b59b6", "#1abc9c", "#34495e"
         ]
 
+    def _get_bottleneck_prefix(self, timestamp: float, events: List[BottleneckEvent]) -> str:
+        for e in events:
+            if e.start_time <= timestamp <= e.end_time:
+                if e.event_type == BottleneckType.CONGESTION:
+                    return "🔴"
+                elif e.event_type == BottleneckType.RTG_CONFLICT:
+                    return "🟠"
+                elif e.event_type == BottleneckType.GATE_SATURATION:
+                    return "🟡"
+        return "  "
+
     def create_heatmap_animation(self, snapshots: List[YardSnapshot], zone: ZoneType,
-                                 bottleneck_events: List[BottleneckEvent] = None) -> go.Figure:
+                                 bottleneck_events: List[BottleneckEvent] = None,
+                                 playback_speed: int = 1,
+                                 total_duration: float = None,
+                                 start_frame: int = 0) -> go.Figure:
         if not snapshots:
             return go.Figure()
 
@@ -376,32 +390,115 @@ class ReplayVisualizer:
         num_rows = max(s.row for s in zone_data_ref) + 1
         num_tiers = max(s.tier for s in zone_data_ref) + 1
 
+        if total_duration is None:
+            total_duration = snapshots[-1].timestamp if snapshots else 10080.0
+
+        bottleneck_events = bottleneck_events or []
+
+        frame_duration_ms = int(500 / playback_speed)
+        transition_ms = int(200 / playback_speed)
+
+        start_frame = max(0, min(start_frame, len(snapshots) - 1))
+        first_snap = snapshots[start_frame]
+
+        color_map = {
+            BottleneckType.CONGESTION: "#e74c3c",
+            BottleneckType.RTG_CONFLICT: "#f39c12",
+            BottleneckType.GATE_SATURATION: "#f1c40f",
+        }
+        label_map = {
+            BottleneckType.CONGESTION: "拥堵",
+            BottleneckType.RTG_CONFLICT: "场桥冲突",
+            BottleneckType.GATE_SATURATION: "闸口饱和",
+        }
+
+        fig = go.Figure()
+
+        x_labels = [f"Bay {b}" for b in range(num_bays)]
+        y_labels = [f"Row {r}" for r in range(num_rows)]
+
+        zone_slots_0 = first_snap.slot_snapshots.get(zone, [])
+        heatmap_z_0 = [[0] * num_bays for _ in range(num_rows)]
+        hover_texts_0 = [[""] * num_bays for _ in range(num_rows)]
+
+        for slot in zone_slots_0:
+            if slot.stack_height > heatmap_z_0[slot.row][slot.bay]:
+                heatmap_z_0[slot.row][slot.bay] = slot.stack_height
+
+        for slot in zone_slots_0:
+            if slot.tier == slot.stack_height - 1 and not slot.is_empty:
+                info = (f"Bay: {slot.bay}<br>Row: {slot.row}<br>"
+                        f"Height: {slot.stack_height}/{num_tiers}<br>"
+                        f"Top: {slot.container_id or '空'}<br>"
+                        f"Weight: {slot.weight_class or 'N/A'}")
+                hover_texts_0[slot.row][slot.bay] = info
+
+        fig.add_trace(
+            go.Heatmap(
+                z=heatmap_z_0,
+                x=x_labels,
+                y=y_labels,
+                text=hover_texts_0,
+                hoverinfo="text",
+                colorscale="Blues",
+                zmin=0,
+                zmax=num_tiers,
+                colorbar=dict(
+                    title="堆高层数",
+                    x=1.02,
+                    y=0.55,
+                    len=0.65,
+                ),
+                showscale=True,
+            ),
+        )
+
+        zone_rtgs_0 = first_snap.rtg_snapshots.get(zone, [])
+        for idx, rtg in enumerate(zone_rtgs_0):
+            color = self.rtg_colors[idx % len(self.rtg_colors)]
+            status_symbol, status_label = self._rtg_marker_info(rtg.status)
+            fig.add_trace(
+                go.Scatter(
+                    x=[f"Bay {rtg.current_bay}"],
+                    y=[f"Row {num_rows // 2}"],
+                    mode="markers+text",
+                    marker=dict(
+                        symbol=status_symbol,
+                        size=22,
+                        color=color,
+                        line=dict(width=2, color="black"),
+                    ),
+                    text=[f"🏗{idx + 1}"],
+                    textposition="top center",
+                    name=f"场桥{idx + 1}",
+                    hovertext=f"{rtg.rtg_id}<br>位置: Bay {rtg.current_bay}<br>状态: {status_label}",
+                    hoverinfo="text",
+                    showlegend=True,
+                    legendgroup="rtgs",
+                ),
+            )
+
+        max_num_rtgs = max(len(s.rtg_snapshots.get(zone, [])) for s in snapshots)
+
         frames = []
-        for snap in snapshots:
+        for snap_idx, snap in enumerate(snapshots):
             zone_slots = snap.slot_snapshots.get(zone, [])
             heatmap_z = [[0] * num_bays for _ in range(num_rows)]
             hover_texts = [[""] * num_bays for _ in range(num_rows)]
-            zone_rtgs = snap.rtg_snapshots.get(zone, [])
 
             for slot in zone_slots:
                 if slot.stack_height > heatmap_z[slot.row][slot.bay]:
                     heatmap_z[slot.row][slot.bay] = slot.stack_height
 
             for slot in zone_slots:
-                if slot.tier == 0 or slot.stack_height > 0:
-                    existing = hover_texts[slot.row][slot.bay]
-                    if slot.tier == slot.stack_height - 1 and not slot.is_empty:
-                        info = (f"Bay: {slot.bay}<br>Row: {slot.row}<br>"
-                                f"Height: {slot.stack_height}/{num_tiers}<br>"
-                                f"Top: {slot.container_id or '空'}<br>"
-                                f"Weight: {slot.weight_class or 'N/A'}")
-                        if not existing:
-                            hover_texts[slot.row][slot.bay] = info
+                if slot.tier == slot.stack_height - 1 and not slot.is_empty:
+                    info = (f"Bay: {slot.bay}<br>Row: {slot.row}<br>"
+                            f"Height: {slot.stack_height}/{num_tiers}<br>"
+                            f"Top: {slot.container_id or '空'}<br>"
+                            f"Weight: {slot.weight_class or 'N/A'}")
+                    hover_texts[slot.row][slot.bay] = info
 
-            x_labels = [f"Bay {b}" for b in range(num_bays)]
-            y_labels = [f"Row {r}" for r in range(num_rows)]
-
-            traces = [
+            frame_traces = [
                 go.Heatmap(
                     z=heatmap_z,
                     x=x_labels,
@@ -411,135 +508,244 @@ class ReplayVisualizer:
                     colorscale="Blues",
                     zmin=0,
                     zmax=num_tiers,
-                    colorbar=dict(title="堆高层数", x=1.02),
-                    showscale=True,
-                )
+                ),
             ]
 
-            for idx, rtg in enumerate(zone_rtgs):
-                color = self.rtg_colors[idx % len(self.rtg_colors)]
-                status_symbol = "circle"
-                if rtg.status == RTGStatus.WORKING:
-                    status_symbol = "diamond"
-                elif rtg.status == RTGStatus.WAITING:
-                    status_symbol = "x"
-
-                status_label = {
-                    RTGStatus.IDLE: "空闲",
-                    RTGStatus.WORKING: "作业中",
-                    RTGStatus.WAITING: "等待让路",
-                }[rtg.status]
-
-                traces.append(go.Scatter(
-                    x=[f"Bay {rtg.current_bay}"],
-                    y=[f"Row {num_rows // 2}"],
-                    mode="markers+text",
-                    marker=dict(
-                        symbol=status_symbol,
-                        size=18,
-                        color=color,
-                        line=dict(width=2, color="black"),
-                    ),
-                    text=[f"🏗️{idx + 1}"],
-                    textposition="top center",
-                    name=f"场桥{idx + 1}",
-                    hovertext=f"{rtg.rtg_id}<br>位置: Bay {rtg.current_bay}<br>状态: {status_label}",
-                    hoverinfo="text",
-                    showlegend=True,
-                    legendgroup="rtgs",
-                ))
+            zone_rtgs = snap.rtg_snapshots.get(zone, [])
+            for idx in range(max_num_rtgs):
+                if idx < len(zone_rtgs):
+                    rtg = zone_rtgs[idx]
+                    color = self.rtg_colors[idx % len(self.rtg_colors)]
+                    status_symbol, status_label = self._rtg_marker_info(rtg.status)
+                    frame_traces.append(go.Scatter(
+                        x=[f"Bay {rtg.current_bay}"],
+                        y=[f"Row {num_rows // 2}"],
+                        mode="markers+text",
+                        marker=dict(
+                            symbol=status_symbol,
+                            size=22,
+                            color=color,
+                            line=dict(width=2, color="black"),
+                        ),
+                        text=[f"🏗{idx + 1}"],
+                        textposition="top center",
+                        hovertext=f"{rtg.rtg_id}<br>位置: Bay {rtg.current_bay}<br>状态: {status_label}",
+                        hoverinfo="text",
+                    ))
+                else:
+                    frame_traces.append(go.Scatter(
+                        x=[None], y=[None], mode="markers",
+                        hoverinfo="none", showlegend=False,
+                    ))
 
             frames.append(go.Frame(
-                data=traces,
-                name=f"{snap.timestamp:.0f}",
+                data=frame_traces,
+                name=f"frame_{snap_idx}",
+                layout=go.Layout(
+                    title=(f"{zone.value.capitalize()}区 热力动态回放 — "
+                           f"时刻: {_format_time(snap.timestamp)} | "
+                           f"利用率: {snap.zone_utilization.get(zone, 0):.1%} | "
+                           f"闸口排队: {snap.gate_queue_total}辆 | "
+                           f"场桥作业: {len([r for r in snap.rtg_snapshots.get(zone, []) if r.status == RTGStatus.WORKING])}"),
+                    annotations=self._build_bottleneck_annotations(bottleneck_events, snap.timestamp),
+                ),
             ))
 
-        if not frames:
-            return go.Figure()
+        fig.frames = frames
 
-        fig = go.Figure(
-            data=frames[0].data,
-            layout=go.Layout(
-                title=f"{zone.value.capitalize()}区 热力动态回放",
-                xaxis=dict(title="贝位 (Bay)"),
-                yaxis=dict(title="排 (Row)"),
-                height=550,
-                updatemenus=[
-                    dict(
-                        type="buttons",
-                        showactive=False,
-                        y=-0.25,
-                        x=-0.05,
-                        xanchor="right",
-                        yanchor="top",
-                        pad=dict(t=0, r=10),
-                        buttons=[
-                            dict(
-                                label="▶ 播放",
-                                method="animate",
-                                args=[
-                                    None,
-                                    dict(
-                                        frame=dict(duration=500, redraw=True),
-                                        fromcurrent=True,
-                                        transition=dict(duration=0),
-                                    ),
-                                ],
-                            ),
-                            dict(
-                                label="⏸ 暂停",
-                                method="animate",
-                                args=[
-                                    [None],
-                                    dict(
-                                        frame=dict(duration=0, redraw=False),
-                                        mode="immediate",
-                                        transition=dict(duration=0),
-                                    ),
-                                ],
-                            ),
-                        ],
-                    ),
-                ],
-                sliders=[
-                    dict(
-                        active=0,
-                        yanchor="top",
-                        xanchor="left",
-                        currentvalue=dict(
-                            font=dict(size=14),
-                            prefix="时间: ",
-                            suffix=" 分钟",
-                            visible=True,
-                            xanchor="right",
+        slider_steps = []
+        for snap_idx, snap in enumerate(snapshots):
+            prefix = self._get_bottleneck_prefix(snap.timestamp, bottleneck_events)
+            time_str = _format_time(snap.timestamp)
+            slider_steps.append(
+                dict(
+                    method="animate",
+                    label=f"{prefix} {time_str}",
+                    args=[
+                        [f"frame_{snap_idx}"],
+                        dict(
+                            frame=dict(duration=0, redraw=True),
+                            mode="immediate",
+                            transition=dict(duration=0),
                         ),
-                        transition=dict(duration=300, easing="cubic-in-out"),
-                        pad=dict(b=10, t=30),
-                        len=0.9,
-                        x=0.05,
-                        y=-0.15,
-                        steps=[
-                            dict(
-                                method="animate",
-                                label=f"{snap.timestamp:.0f}",
-                                args=[
-                                    [f"{snap.timestamp:.0f}"],
-                                    dict(
-                                        frame=dict(duration=300, redraw=True),
-                                        mode="immediate",
-                                        transition=dict(duration=0),
-                                    ),
-                                ],
-                            )
-                            for snap in snapshots
-                        ],
-                    )
-                ],
+                    ],
+                )
+            )
+
+        fig.update_layout(
+            height=620,
+            title=f"{zone.value.capitalize()}区 热力动态回放  "
+                  f"(🔴=拥堵  🟠=场桥冲突  🟡=闸口饱和预警  ⬜=正常)",
+            xaxis_title="贝位 (Bay)",
+            yaxis_title="排 (Row)",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1,
             ),
-            frames=frames,
+            annotations=self._build_bottleneck_annotations(bottleneck_events, first_snap.timestamp),
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    showactive=True,
+                    active=0 if start_frame else -1,
+                    y=-0.18,
+                    x=0.0,
+                    xanchor="left",
+                    yanchor="top",
+                    direction="left",
+                    pad=dict(t=0, r=10, l=0, b=0),
+                    buttons=[
+                        dict(
+                            label="⏮ 第一帧",
+                            method="animate",
+                            args=[
+                                [f"frame_0"],
+                                dict(
+                                    frame=dict(duration=0, redraw=True),
+                                    mode="immediate",
+                                    transition=dict(duration=0),
+                                ),
+                            ],
+                        ),
+                        dict(
+                            label="◀ 上一帧",
+                            method="animate",
+                            args=[
+                                [f"frame_{max(0, start_frame - 1)}"],
+                                dict(
+                                    frame=dict(duration=0, redraw=True),
+                                    mode="immediate",
+                                    transition=dict(duration=0),
+                                ),
+                            ],
+                        ),
+                        dict(
+                            label="▶ 播放",
+                            method="animate",
+                            args=[
+                                None,
+                                dict(
+                                    frame=dict(duration=frame_duration_ms, redraw=True),
+                                    fromcurrent=True,
+                                    transition=dict(duration=transition_ms, easing="cubic-in-out"),
+                                    mode="immediate",
+                                ),
+                            ],
+                        ),
+                        dict(
+                            label="⏸ 暂停",
+                            method="animate",
+                            args=[
+                                [None],
+                                dict(
+                                    frame=dict(duration=0, redraw=False),
+                                    mode="immediate",
+                                    transition=dict(duration=0),
+                                ),
+                            ],
+                        ),
+                        dict(
+                            label="▶ 下一帧",
+                            method="animate",
+                            args=[
+                                [f"frame_{min(len(snapshots) - 1, start_frame + 1)}"],
+                                dict(
+                                    frame=dict(duration=0, redraw=True),
+                                    mode="immediate",
+                                    transition=dict(duration=0),
+                                ),
+                            ],
+                        ),
+                        dict(
+                            label="⏭ 最后一帧",
+                            method="animate",
+                            args=[
+                                [f"frame_{len(snapshots) - 1}"],
+                                dict(
+                                    frame=dict(duration=0, redraw=True),
+                                    mode="immediate",
+                                    transition=dict(duration=0),
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+            sliders=[
+                dict(
+                    active=start_frame,
+                    yanchor="top",
+                    xanchor="left",
+                    currentvalue=dict(
+                        font=dict(size=14, color="#2c3e50"),
+                        prefix="⏱ 当前时刻: ",
+                        suffix="",
+                        visible=True,
+                        xanchor="right",
+                    ),
+                    transition=dict(duration=transition_ms, easing="cubic-in-out"),
+                    pad=dict(b=10, t=40, l=0, r=0),
+                    len=1.0,
+                    x=0.0,
+                    y=-0.05,
+                    steps=slider_steps,
+                ),
+            ],
         )
 
         return fig
+
+    def _build_bottleneck_annotations(self, events: List[BottleneckEvent],
+                                       current_time: float) -> List[Dict]:
+        if not events:
+            return []
+        color_map = {
+            BottleneckType.CONGESTION: "#e74c3c",
+            BottleneckType.RTG_CONFLICT: "#f39c12",
+            BottleneckType.GATE_SATURATION: "#f1c40f",
+        }
+        anns = []
+        y_positions = {
+            BottleneckType.CONGESTION: 0.02,
+            BottleneckType.RTG_CONFLICT: 0.06,
+            BottleneckType.GATE_SATURATION: 0.10,
+        }
+        active_labels = []
+        for e in events:
+            if e.start_time <= current_time <= e.end_time:
+                c = color_map.get(e.event_type, "#95a5a6")
+                if e.event_type == BottleneckType.CONGESTION:
+                    active_labels.append(f"🔴 拥堵")
+                elif e.event_type == BottleneckType.RTG_CONFLICT:
+                    active_labels.append(f"🟠 场桥冲突")
+                elif e.event_type == BottleneckType.GATE_SATURATION:
+                    active_labels.append(f"🟡 闸口饱和")
+        if active_labels:
+            anns.append(dict(
+                x=0.01, y=0.98,
+                xref="paper", yref="paper",
+                text=" | ".join(active_labels),
+                showarrow=False,
+                font=dict(size=13, color="white", family="Arial Black"),
+                bgcolor="#2c3e50",
+                bordercolor="#34495e",
+                borderwidth=1,
+                borderpad=4,
+                xanchor="left",
+                yanchor="top",
+            ))
+        return anns
+
+    def _rtg_marker_info(self, status: RTGStatus) -> Tuple[str, str]:
+        if status == RTGStatus.WORKING:
+            return "diamond", "作业中"
+        elif status == RTGStatus.WAITING:
+            return "x", "等待让路"
+        else:
+            return "circle", "空闲"
 
     def create_static_heatmap_frame(self, snapshot: YardSnapshot, zone: ZoneType) -> go.Figure:
         zone_slots = snapshot.slot_snapshots.get(zone, [])
