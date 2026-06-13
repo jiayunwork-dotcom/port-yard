@@ -241,7 +241,8 @@ class Visualizer:
 
     def plot_kpi_comparison(self, kpi_results: Dict[str, KPIResult]) -> go.Figure:
         strategies = list(kpi_results.keys())
-        metrics = ["翻箱率", "平均利用率", "平均提箱耗时", "场桥效率", "日均吞吐量"]
+        metrics = ["翻箱率", "平均利用率", "平均提箱耗时", "场桥效率", "日均吞吐量",
+                   "集卡等待时间", "闸口利用率", "集卡拒绝率"]
 
         normalized_values = {}
         for metric in metrics:
@@ -258,16 +259,23 @@ class Visualizer:
                     values.append(kpi.avg_rtg_efficiency)
                 elif metric == "日均吞吐量":
                     values.append(kpi.daily_throughput)
+                elif metric == "集卡等待时间":
+                    values.append(kpi.avg_truck_wait_time)
+                elif metric == "闸口利用率":
+                    values.append(kpi.avg_gate_utilization * 100)
+                elif metric == "集卡拒绝率":
+                    values.append(kpi.truck_rejection_rate * 100)
             normalized_values[metric] = values
 
         fig = make_subplots(
-            rows=2, cols=3,
+            rows=3, cols=3,
             subplot_titles=metrics,
             specs=[[{"type": "bar"}, {"type": "bar"}, {"type": "bar"}],
+                   [{"type": "bar"}, {"type": "bar"}, {"type": "bar"}],
                    [{"type": "bar"}, {"type": "bar"}, {"type": "bar"}]],
         )
 
-        positions = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2)]
+        positions = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (2, 3), (3, 1), (3, 2)]
 
         for i, (metric, values) in enumerate(normalized_values.items()):
             row, col = positions[i]
@@ -285,7 +293,7 @@ class Visualizer:
 
         fig.update_layout(
             title="各策略KPI对比",
-            height=600,
+            height=800,
             showlegend=False,
         )
 
@@ -429,5 +437,39 @@ class Visualizer:
         )
 
         fig.update_xaxes(title_text=param_name)
+
+        return fig
+
+    def plot_gate_queue_trend(self, stats: SimulationStats) -> go.Figure:
+        fig = go.Figure()
+
+        gate_colors = [
+            "#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6",
+            "#1abc9c", "#34495e", "#e67e22", "#16a085", "#8e44ad",
+        ]
+
+        for i, (gate_id, history) in enumerate(stats.gate_queue_history.items()):
+            times = [t / 60.0 for t, _ in history]
+            queue_lens = [q for _, q in history]
+            color = gate_colors[i % len(gate_colors)]
+
+            fig.add_trace(
+                go.Scatter(
+                    x=times,
+                    y=queue_lens,
+                    mode="lines",
+                    name=gate_id.replace("gate_", "闸口 "),
+                    line=dict(color=color, width=2),
+                )
+            )
+
+        fig.update_layout(
+            title="闸口排队长度随时间变化",
+            xaxis_title="时间 (小时)",
+            yaxis_title="排队车辆数",
+            height=400,
+            hovermode="x unified",
+            legend_title="闸口",
+        )
 
         return fig

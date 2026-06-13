@@ -59,6 +59,12 @@ def get_default_config():
             "ship_size_std": 20,
             "export_truck_interval": 30.0,
         },
+        "truck_scheduling": {
+            "num_gates": 3,
+            "gate_process_time": 2.0,
+            "max_queue_length": 20,
+            "early_arrival_tolerance": 30.0,
+        },
     }
 
 
@@ -132,6 +138,19 @@ def sidebar_config():
     config["simulation"]["ship_interval_mean"] = ship_interval
     config["simulation"]["ship_size_mean"] = ship_size
 
+    st.sidebar.subheader("🚛 集卡调度")
+
+    with st.sidebar.expander("闸口与排队参数", expanded=False):
+        num_gates = st.number_input("堆场入口闸口数量", 1, 10, config["truck_scheduling"]["num_gates"], key="num_gates")
+        gate_process_time = st.number_input("每辆集卡过闸耗时(分钟)", 0.5, 30.0, config["truck_scheduling"]["gate_process_time"], 0.5, key="gate_process_time")
+        max_queue_length = st.number_input("集卡最大排队长度", 5, 100, config["truck_scheduling"]["max_queue_length"], key="max_queue_length")
+        early_arrival_tolerance = st.number_input("集卡提前到达容忍时间(分钟)", 0.0, 240.0, config["truck_scheduling"]["early_arrival_tolerance"], 5.0, key="early_arrival_tolerance")
+
+    config["truck_scheduling"]["num_gates"] = num_gates
+    config["truck_scheduling"]["gate_process_time"] = gate_process_time
+    config["truck_scheduling"]["max_queue_length"] = max_queue_length
+    config["truck_scheduling"]["early_arrival_tolerance"] = early_arrival_tolerance
+
     st.sidebar.subheader("🎯 堆垛策略")
     strategy = st.sidebar.selectbox(
         "选择策略",
@@ -182,7 +201,7 @@ def main():
     with tab1:
         st.header("仿真运行")
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.info(f"**当前策略**: {strategy.value}")
             total_slots = sum(
@@ -196,6 +215,11 @@ def main():
             st.metric("仿真时长", f"{sim_duration_days:.0f} 天")
             total_rtgs = sum(config["rtg"]["num_rtgs"].values())
             st.metric("总场桥数", total_rtgs)
+
+        with col3:
+            num_gates = config["truck_scheduling"]["num_gates"]
+            st.metric("闸口数量", num_gates)
+            st.metric("过闸耗时", f"{config['truck_scheduling']['gate_process_time']:.1f} 分钟")
 
         st.markdown("---")
 
@@ -230,7 +254,7 @@ def main():
 
             kpi = st.session_state.kpi
 
-            kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
+            kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
             with kpi_col1:
                 st.metric("翻箱率", f"{kpi.relocation_rate:.2%}")
                 st.metric("平均利用率", f"{kpi.avg_utilization:.2%}")
@@ -240,6 +264,9 @@ def main():
             with kpi_col3:
                 st.metric("日均吞吐量", f"{kpi.daily_throughput:.0f} TEU")
                 st.metric("总翻箱次数", kpi.total_relocations)
+            with kpi_col4:
+                st.metric("集卡平均等待时间", f"{kpi.avg_truck_wait_time:.1f} 分钟")
+                st.metric("集卡拒绝率", f"{kpi.truck_rejection_rate:.2%}")
 
     with tab2:
         st.header("堆场可视化")
@@ -294,6 +321,7 @@ def main():
             st.info("请先运行仿真以查看KPI分析。")
         else:
             kpi = st.session_state.kpi
+            engine = st.session_state.engine
 
             st.subheader("📋 详细KPI报表")
 
@@ -309,6 +337,11 @@ def main():
                     "总翻箱次数",
                     "总提箱作业次数",
                     "总堆存作业次数",
+                    "集卡平均等待时间",
+                    "闸口平均利用率",
+                    "集卡拒绝率",
+                    "集卡总到达数",
+                    "集卡总拒绝数",
                 ],
                 "数值": [
                     f"{kpi.relocation_rate:.2%}",
@@ -321,23 +354,40 @@ def main():
                     str(kpi.total_relocations),
                     str(kpi.total_pickup_operations),
                     str(kpi.total_containers_stowed),
+                    f"{kpi.avg_truck_wait_time:.1f} 分钟",
+                    f"{kpi.avg_gate_utilization:.2%}",
+                    f"{kpi.truck_rejection_rate:.2%}",
+                    str(kpi.total_truck_arrivals),
+                    str(kpi.total_truck_rejections),
                 ],
             }
             st.table(kpi_data)
 
             st.markdown("---")
-            st.subheader("🏗️ 各场桥效率")
+            col_gate1, col_gate2 = st.columns(2)
+            with col_gate1:
+                st.subheader("🚛 各闸口利用率")
+                gate_data = {"闸口ID": [], "利用率": []}
+                for gate_id, util in kpi.gate_utilization.items():
+                    gate_data["闸口ID"].append(gate_id.replace("gate_", "闸口 "))
+                    gate_data["利用率"].append(f"{util:.2%}")
+                st.table(gate_data)
 
-            rtg_data = {"场桥ID": [], "效率(箱/小时)": [], "完成作业数": []}
-            engine = st.session_state.engine
-            for zone, rtgs in engine.rtgs.items():
-                for rtg in rtgs:
-                    rtg_data["场桥ID"].append(rtg.rtg_id)
-                    efficiency = kpi.rtg_efficiency.get(rtg.rtg_id, 0)
-                    rtg_data["效率(箱/小时)"].append(f"{efficiency:.2f}")
-                    rtg_data["完成作业数"].append(rtg.total_tasks_completed)
+            with col_gate2:
+                st.subheader("🏗️ 各场桥效率")
+                rtg_data = {"场桥ID": [], "效率(箱/小时)": [], "完成作业数": []}
+                for zone, rtgs in engine.rtgs.items():
+                    for rtg in rtgs:
+                        rtg_data["场桥ID"].append(rtg.rtg_id)
+                        efficiency = kpi.rtg_efficiency.get(rtg.rtg_id, 0)
+                        rtg_data["效率(箱/小时)"].append(f"{efficiency:.2f}")
+                        rtg_data["完成作业数"].append(rtg.total_tasks_completed)
+                st.table(rtg_data)
 
-            st.table(rtg_data)
+            st.markdown("---")
+            st.subheader("📊 闸口排队长度随时间变化")
+            fig_queue = visualizer.plot_gate_queue_trend(engine.stats)
+            st.plotly_chart(fig_queue, use_container_width=True)
 
             st.markdown("---")
             st.subheader("📊 场桥作业甘特图")
@@ -403,6 +453,9 @@ def main():
                 "平均提箱耗时(min)": [],
                 "日均吞吐量(TEU)": [],
                 "总翻箱次数": [],
+                "集卡平均等待(min)": [],
+                "闸口利用率": [],
+                "集卡拒绝率": [],
             }
 
             for strat_key, kpi in results.items():
@@ -412,6 +465,9 @@ def main():
                 table_data["平均提箱耗时(min)"].append(f"{kpi.avg_pickup_time:.1f}")
                 table_data["日均吞吐量(TEU)"].append(f"{kpi.daily_throughput:.0f}")
                 table_data["总翻箱次数"].append(kpi.total_relocations)
+                table_data["集卡平均等待(min)"].append(f"{kpi.avg_truck_wait_time:.1f}")
+                table_data["闸口利用率"].append(f"{kpi.avg_gate_utilization:.2%}")
+                table_data["集卡拒绝率"].append(f"{kpi.truck_rejection_rate:.2%}")
 
             st.table(table_data)
 

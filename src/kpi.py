@@ -20,6 +20,12 @@ class KPIResult:
     total_relocations: int = 0
     total_pickup_operations: int = 0
     avg_rtg_efficiency: float = 0.0
+    avg_truck_wait_time: float = 0.0
+    avg_gate_utilization: float = 0.0
+    truck_rejection_rate: float = 0.0
+    gate_utilization: Dict[str, float] = field(default_factory=dict)
+    total_truck_arrivals: int = 0
+    total_truck_rejections: int = 0
 
     def to_dict(self) -> Dict:
         return {
@@ -32,6 +38,9 @@ class KPIResult:
             "总吞吐量(TEU)": self.total_throughput,
             "总翻箱次数": self.total_relocations,
             "总提箱次数": self.total_pickup_operations,
+            "集卡平均等待时间(分钟)": f"{self.avg_truck_wait_time:.1f}",
+            "闸口平均利用率": f"{self.avg_gate_utilization:.2%}",
+            "集卡拒绝率": f"{self.truck_rejection_rate:.2%}",
         }
 
 
@@ -76,6 +85,27 @@ class KPICalculator:
         kpi.daily_throughput = kpi.total_throughput / days if days > 0 else 0
         kpi.total_containers_stowed = stats.total_containers_stowed
         kpi.total_containers_picked = stats.total_containers_picked
+
+        if stats.truck_gate_wait_times:
+            kpi.avg_truck_wait_time = statistics.mean(stats.truck_gate_wait_times)
+
+        kpi.gate_utilization = {}
+        total_gate_util = 0.0
+        gate_count = 0
+        for gate_id, busy_time in stats.gate_busy_times.items():
+            if self.sim_duration > 0:
+                util = busy_time / self.sim_duration
+            else:
+                util = 0.0
+            kpi.gate_utilization[gate_id] = util
+            total_gate_util += util
+            gate_count += 1
+        kpi.avg_gate_utilization = total_gate_util / gate_count if gate_count > 0 else 0.0
+
+        kpi.total_truck_arrivals = stats.total_truck_arrivals
+        kpi.total_truck_rejections = stats.total_truck_rejections
+        if stats.total_truck_arrivals > 0:
+            kpi.truck_rejection_rate = stats.total_truck_rejections / stats.total_truck_arrivals
 
         return kpi
 

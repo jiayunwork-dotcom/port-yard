@@ -37,6 +37,11 @@ class SimulationStats:
     import_containers_arrived: int = 0
     export_containers_arrived: int = 0
     daily_throughput: List[Tuple[float, int]] = field(default_factory=list)
+    truck_gate_wait_times: List[float] = field(default_factory=list)
+    total_truck_arrivals: int = 0
+    total_truck_rejections: int = 0
+    gate_busy_times: Dict[str, float] = field(default_factory=dict)
+    gate_queue_history: Dict[str, List[Tuple[float, int]]] = field(default_factory=dict)
 
 
 class SimulationEngine:
@@ -67,6 +72,9 @@ class SimulationEngine:
         self.rtgs: Dict[ZoneType, List[RTG]] = {}
         self.rtg_resources: Dict[ZoneType, List[simpy.Resource]] = {}
         self._init_rtgs()
+
+        self.gate_resources: List[simpy.Resource] = []
+        self._init_gates()
 
         self.pending_tasks: Dict[ZoneType, List[RTGTask]] = {
             zone: [] for zone in ZoneType
@@ -105,6 +113,16 @@ class SimulationEngine:
             self.rtgs[zone] = rtgs
             self.rtg_resources[zone] = resources
 
+    def _init_gates(self):
+        truck_config = self.config.get("truck_scheduling", {})
+        num_gates = truck_config.get("num_gates", 3)
+
+        for i in range(num_gates):
+            gate_id = f"gate_{i}"
+            self.gate_resources.append(simpy.Resource(self.env, capacity=1))
+            self.stats.gate_busy_times[gate_id] = 0.0
+            self.stats.gate_queue_history[gate_id] = []
+
     def _rtg_time(self, seconds: float) -> float:
         return seconds / 60.0
 
@@ -116,9 +134,92 @@ class SimulationEngine:
         self.env.process(self._export_truck_arrival_process())
         self.env.process(self._utilization_monitor())
         self.env.process(self._rtg_dispatcher())
+        self.env.process(self._gate_queue_monitor())
 
         self.env.run(until=sim_duration_minutes)
         return self.stats
+
+    def _gate_queue_monitor(self):
+        interval = 5.0
+        while True:
+            for i, resource in enumerate(self.gate_resources):
+                gate_id = f"gate_{i}"
+                queue_len = len(resource.queue)
+                self.stats.gate_queue_history[gate_id].append(
+                    (self.env.now, queue_len)
+                )
+            yield self.env.timeout(interval)
+
+    def _process_truck_through_gate(self, container: Container, appointment_start: float = None):
+        truck_config = self.config.get("truck_scheduling", {})
+        gate_process_time = truck_config.get("gate_process_time", 2.0)
+        max_queue_length = truck_config.get("max_queue_length", 20)
+        early_tolerance = truck_config.get("early_arrival_tolerance", 30.0)
+
+        self.stats.total_truck_arrivals += 1
+
+        if appointment_start is not None:
+            if self.env.now < appointment_start - early_tolerance:
+                self.stats.total_truck_rejections += 1
+                self.stats.truck_log.append(
+                    {
+                        "time": self.env.now,
+                        "container_id": container.container_id,
+                        "event": "truck_rejected_early",
+                        "reason": "too_early",
+                    }
+                )
+                retry_time = max(0, appointment_start - early_tolerance - self.env.now) + 1.0
+                yield self.env.timeout(retry_time)
+                self.env.process(self._process_truck_through_gate(container, appointment_start))
+                return False
+
+        total_queue = sum(len(r.queue) for r in self.gate_resources)
+        if total_queue >= max_queue_length:
+            self.stats.total_truck_rejections += 1
+            self.stats.truck_log.append(
+                {
+                    "time": self.env.now,
+                    "container_id": container.container_id,
+                    "event": "truck_rejected_queue_full",
+                    "reason": "queue_full",
+                }
+            )
+            yield self.env.timeout(30.0)
+            self.env.process(self._process_truck_through_gate(container, appointment_start))
+            return False
+
+        arrival_time = self.env.now
+        best_gate_idx = 0
+        min_queue = len(self.gate_resources[0].queue)
+        for i in range(1, len(self.gate_resources)):
+            qlen = len(self.gate_resources[i].queue)
+            if qlen < min_queue:
+                min_queue = qlen
+                best_gate_idx = i
+
+        gate_resource = self.gate_resources[best_gate_idx]
+        gate_id = f"gate_{best_gate_idx}"
+
+        with gate_resource.request() as req:
+            yield req
+            wait_time = self.env.now - arrival_time
+            self.stats.truck_gate_wait_times.append(wait_time)
+
+            process_start = self.env.now
+            yield self.env.timeout(gate_process_time)
+            self.stats.gate_busy_times[gate_id] += self.env.now - process_start
+
+        self.stats.truck_log.append(
+            {
+                "time": self.env.now,
+                "container_id": container.container_id,
+                "event": "truck_passed_gate",
+                "gate": gate_id,
+                "wait_time": wait_time,
+            }
+        )
+        return True
 
     def _ship_arrival_process(self):
         sim_config = self.config.get("simulation", {})
@@ -213,6 +314,15 @@ class SimulationEngine:
         if self.env.now >= self.sim_duration:
             return
 
+        gate_passed = yield from self._process_truck_through_gate(
+            container, appointment_start=container.arrival_time
+        )
+        if not gate_passed:
+            return
+
+        if self.env.now >= self.sim_duration:
+            return
+
         self._add_stow_task(container, ZoneType.EXPORT)
 
         self.stats.truck_log.append(
@@ -268,26 +378,56 @@ class SimulationEngine:
 
                 self._pending_pickup.add(container_id)
 
-                pickup_task = RTGTask(
-                    task_id=task_id,
-                    task_type=TaskType.PICKUP,
-                    zone=slot.zone,
-                    bay=slot.bay,
-                    container_id=container.container_id,
-                    arrival_time=self.env.now,
-                    priority=2,
+                self.env.process(
+                    self._import_pickup_truck_process(container, pickup_start)
                 )
-                self._task_container_map[task_id] = container
-                self.pending_tasks[slot.zone].append(pickup_task)
 
-                self.stats.truck_log.append(
-                    {
-                        "time": self.env.now,
-                        "container_id": container.container_id,
-                        "event": "truck_arrives_for_pickup",
-                        "zone": slot.zone.value,
-                    }
-                )
+    def _import_pickup_truck_process(self, container: Container, appointment_start: float):
+        if self.env.now >= self.sim_duration:
+            return
+
+        gate_passed = yield from self._process_truck_through_gate(
+            container, appointment_start=appointment_start
+        )
+        if not gate_passed:
+            return
+
+        if self.env.now >= self.sim_duration:
+            return
+
+        slot = self.yard.find_container(container)
+        if not slot:
+            return
+
+        task_id = f"pickup_{container.container_id}"
+        already_pending = any(
+            t.task_id == task_id
+            for zone_tasks in self.pending_tasks.values()
+            for t in zone_tasks
+        )
+        if already_pending:
+            return
+
+        pickup_task = RTGTask(
+            task_id=task_id,
+            task_type=TaskType.PICKUP,
+            zone=slot.zone,
+            bay=slot.bay,
+            container_id=container.container_id,
+            arrival_time=self.env.now,
+            priority=2,
+        )
+        self._task_container_map[task_id] = container
+        self.pending_tasks[slot.zone].append(pickup_task)
+
+        self.stats.truck_log.append(
+            {
+                "time": self.env.now,
+                "container_id": container.container_id,
+                "event": "truck_arrives_for_pickup",
+                "zone": slot.zone.value,
+            }
+        )
 
     def _export_truck_arrival_process(self):
         sim_config = self.config.get("simulation", {})
@@ -312,6 +452,16 @@ class SimulationEngine:
 
             self._container_lookup[container.container_id] = container
             self.stats.export_containers_arrived += 1
+
+            gate_passed = yield from self._process_truck_through_gate(
+                container, appointment_start=self.env.now
+            )
+            if not gate_passed:
+                continue
+
+            if self.env.now >= self.sim_duration:
+                break
+
             self._add_stow_task(container, ZoneType.EXPORT)
 
             self.stats.truck_log.append(
