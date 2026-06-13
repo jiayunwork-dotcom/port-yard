@@ -10,6 +10,13 @@ from src.simulation_engine import SimulationEngine
 from src.kpi import KPICalculator, KPIResult
 from src.visualization import Visualizer
 from src.parameter_optimization import ParameterOptimizer
+from src.replay_analysis import (
+    BottleneckDiagnoser,
+    ReplayVisualizer,
+    DiagnosisReportGenerator,
+    BottleneckType,
+    _format_time,
+)
 
 
 st.set_page_config(
@@ -64,6 +71,12 @@ def get_default_config():
             "gate_process_time": 2.0,
             "max_queue_length": 20,
             "early_arrival_tolerance": 30.0,
+        },
+        "replay": {
+            "sampling_interval": 10.0,
+            "congestion_threshold": 0.80,
+            "conflict_distance": 2,
+            "gate_saturation_ratio": 0.80,
         },
     }
 
@@ -193,9 +206,20 @@ def main():
         st.session_state.comparison_results = None
     if "optimization_result" not in st.session_state:
         st.session_state.optimization_result = None
+    if "bottleneck_events" not in st.session_state:
+        st.session_state.bottleneck_events = None
+    if "replay_current_frame" not in st.session_state:
+        st.session_state.replay_current_frame = 0
+    if "replay_playing" not in st.session_state:
+        st.session_state.replay_playing = False
+    if "replay_speed" not in st.session_state:
+        st.session_state.replay_speed = 1
+    if "replay_zone" not in st.session_state:
+        st.session_state.replay_zone = ZoneType.IMPORT
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 仿真运行", "🏗️ 堆场可视化", "📈 KPI分析", "🔄 策略对比", "🎛️ 参数优化"
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📊 仿真运行", "🏗️ 堆场可视化", "📈 KPI分析", "🔄 策略对比", "🎛️ 参数优化",
+        "🎬 热力回放与瓶颈诊断"
     ])
 
     with tab1:
@@ -238,6 +262,8 @@ def main():
         if run_button:
             with st.spinner("正在运行仿真..."):
                 engine = SimulationEngine(config, strategy, strategy_params=strategy_params)
+                replay_cfg = config.get("replay", {})
+                engine.set_snapshot_interval(replay_cfg.get("sampling_interval", 10.0))
                 engine.run(config["simulation"]["duration"])
                 st.session_state.engine = engine
 
@@ -245,6 +271,18 @@ def main():
                 kpi = calc.calculate(engine)
                 st.session_state.kpi = kpi
                 st.session_state.simulation_run = True
+
+                snapshots = engine.snapshot_recorder.get_snapshots()
+                diagnoser = BottleneckDiagnoser(snapshots, config)
+                diagnoser.set_parameters(
+                    congestion_threshold=replay_cfg.get("congestion_threshold", 0.80),
+                    conflict_distance=replay_cfg.get("conflict_distance", 2),
+                    gate_saturation_ratio=replay_cfg.get("gate_saturation_ratio", 0.80),
+                )
+                events = diagnoser.diagnose()
+                st.session_state.bottleneck_events = events
+                st.session_state.replay_current_frame = 0
+                st.session_state.replay_playing = False
 
                 st.success("✅ 仿真完成！")
 
@@ -533,6 +571,298 @@ def main():
                 st.metric("翻箱率", f"{best_kpi.relocation_rate:.2%}")
             with best_col3:
                 st.metric("日均吞吐量", f"{best_kpi.daily_throughput:.0f} TEU")
+
+    with tab6:
+        st.header("🎬 堆场热力动态回放与瓶颈诊断")
+
+        default_replay = get_default_config()["replay"]
+
+        with st.expander("⚙️ 回放与诊断配置 (点击展开/收起)", expanded=False):
+            cfg_col1, cfg_col2 = st.columns(2)
+            with cfg_col1:
+                sampling_interval = st.slider(
+                    "采样间隔 (分钟)",
+                    min_value=1,
+                    max_value=60,
+                    value=int(default_replay["sampling_interval"]),
+                    step=1,
+                    help="仿真过程中每隔多少分钟录制一次堆场快照",
+                    key="replay_sampling_interval",
+                )
+                congestion_threshold = st.slider(
+                    "拥堵阈值 (%)",
+                    min_value=50,
+                    max_value=95,
+                    value=int(default_replay["congestion_threshold"] * 100),
+                    step=1,
+                    help="分区利用率超过此阈值且持续3个以上快照，标记为拥堵",
+                    key="replay_congestion_threshold",
+                )
+            with cfg_col2:
+                conflict_distance = st.slider(
+                    "场桥冲突距离阈值 (贝位)",
+                    min_value=1,
+                    max_value=5,
+                    value=default_replay["conflict_distance"],
+                    step=1,
+                    help="两台场桥贝位间距 ≤ 此值且至少一台等待，标记为冲突",
+                    key="replay_conflict_distance",
+                )
+                gate_saturation_ratio = st.slider(
+                    "闸口饱和预警比例 (%)",
+                    min_value=50,
+                    max_value=95,
+                    value=int(default_replay["gate_saturation_ratio"] * 100),
+                    step=1,
+                    help="排队长度超过最大排队长度的此比例，标记为饱和预警",
+                    key="replay_saturation_ratio",
+                )
+
+            apply_cfg = st.button("🔄 应用新配置并重新诊断", use_container_width=True)
+            if apply_cfg and st.session_state.engine:
+                with st.spinner("正在重新运行瓶颈诊断..."):
+                    engine = st.session_state.engine
+                    snapshots = engine.snapshot_recorder.get_snapshots()
+                    diagnoser = BottleneckDiagnoser(snapshots, config)
+                    diagnoser.set_parameters(
+                        congestion_threshold=congestion_threshold / 100.0,
+                        conflict_distance=conflict_distance,
+                        gate_saturation_ratio=gate_saturation_ratio / 100.0,
+                    )
+                    events = diagnoser.diagnose()
+                    st.session_state.bottleneck_events = events
+                    st.success("✅ 重新诊断完成！")
+
+        if not st.session_state.engine or not st.session_state.simulation_run:
+            st.info("ℹ️ 请先在「📊 仿真运行」标签页中运行仿真，然后才能使用回放与诊断功能。")
+        else:
+            engine = st.session_state.engine
+            snapshots = engine.snapshot_recorder.get_snapshots()
+            events = st.session_state.bottleneck_events or []
+            replay_vis = ReplayVisualizer()
+
+            st.subheader("📊 诊断概览")
+            ev_col1, ev_col2, ev_col3, ev_col4 = st.columns(4)
+            with ev_col1:
+                num_cong = len([e for e in events if e.event_type == BottleneckType.CONGESTION])
+                st.metric("🔴 拥堵事件", num_cong)
+            with ev_col2:
+                num_conf = len([e for e in events if e.event_type == BottleneckType.RTG_CONFLICT])
+                st.metric("🟠 场桥冲突", num_conf)
+            with ev_col3:
+                num_sat = len([e for e in events if e.event_type == BottleneckType.GATE_SATURATION])
+                st.metric("🟡 闸口饱和预警", num_sat)
+            with ev_col4:
+                st.metric("📸 快照总数", len(snapshots))
+
+            st.markdown("---")
+
+            st.subheader("📈 利用率与排队趋势")
+            trend1, trend2 = st.columns(2)
+            with trend1:
+                fig_util = replay_vis.create_zone_utilization_trend(snapshots)
+                st.plotly_chart(fig_util, use_container_width=True)
+            with trend2:
+                fig_queue = replay_vis.create_gate_queue_trend(snapshots)
+                st.plotly_chart(fig_queue, use_container_width=True)
+
+            st.markdown("---")
+
+            st.subheader("⏱️ 瓶颈事件时间轴")
+            total_duration = config["simulation"]["duration"]
+            fig_timeline = replay_vis.create_bottleneck_timeline(events, total_duration)
+            st.plotly_chart(fig_timeline, use_container_width=True)
+
+            if events:
+                st.caption("💡 提示: 下表中点击「跳转到此事件」可将回放器定位到事件起始时刻")
+                event_rows = []
+                for idx, e in enumerate(events):
+                    icon_map = {
+                        BottleneckType.CONGESTION: "🔴",
+                        BottleneckType.RTG_CONFLICT: "🟠",
+                        BottleneckType.GATE_SATURATION: "🟡",
+                    }
+                    type_map = {
+                        BottleneckType.CONGESTION: "拥堵",
+                        BottleneckType.RTG_CONFLICT: "冲突",
+                        BottleneckType.GATE_SATURATION: "饱和预警",
+                    }
+                    event_rows.append({
+                        "序号": idx + 1,
+                        "类型": f"{icon_map[e.event_type]} {type_map[e.event_type]}",
+                        "起始时间": f"{_format_time(e.start_time)}",
+                        "结束时间": f"{_format_time(e.end_time)}",
+                        "持续时长": f"{_format_time(e.duration)}",
+                        "涉及对象": (
+                            ({"import": "进口区", "export": "出口区", "transit": "中转区"}.get(e.zone.value, e.zone.value) if e.zone else "") +
+                            (" | " + "、".join(e.rtg_ids) if e.rtg_ids else "") +
+                            (" | " + e.gate_id.replace("gate_", "闸口") if e.gate_id else "")
+                        ) or "-",
+                        "峰值指标": (
+                            f"{e.peak_metric:.1%}" if e.event_type == BottleneckType.CONGESTION
+                            else f"{e.peak_metric:.0f}贝位" if e.event_type == BottleneckType.RTG_CONFLICT
+                            else f"{e.peak_metric:.0f}辆"
+                        ),
+                    })
+                st.table(event_rows)
+
+                jump_cols = st.columns(min(5, len(events)))
+                for i, col in enumerate(jump_cols):
+                    if i < len(events):
+                        with col:
+                            jump_btn = st.button(
+                                f"⏩ 事件{i+1}: {_format_time(events[i].start_time)}",
+                                key=f"jump_event_{i}",
+                                use_container_width=True,
+                            )
+                            if jump_btn:
+                                target_time = events[i].start_time
+                                closest_idx = 0
+                                min_diff = float("inf")
+                                for j, s in enumerate(snapshots):
+                                    diff = abs(s.timestamp - target_time)
+                                    if diff < min_diff:
+                                        min_diff = diff
+                                        closest_idx = j
+                                st.session_state.replay_current_frame = closest_idx
+
+            st.markdown("---")
+            st.subheader("🎞️ 热力回放器")
+
+            ctrl_col1, ctrl_col2 = st.columns([1, 2])
+            with ctrl_col1:
+                zone_options = [
+                    ("进口区", ZoneType.IMPORT),
+                    ("出口区", ZoneType.EXPORT),
+                    ("中转区", ZoneType.TRANSIT),
+                ]
+                selected_zone = st.selectbox(
+                    "选择回放分区",
+                    zone_options,
+                    format_func=lambda x: x[0],
+                    key="replay_zone_select",
+                    index=0,
+                )
+                current_zone = selected_zone[1]
+            with ctrl_col2:
+                speed_options = [1, 2, 5, 10]
+                selected_speed = st.select_slider(
+                    "播放速度",
+                    options=speed_options,
+                    value=st.session_state.replay_speed,
+                    format_func=lambda x: f"{x}x",
+                    key="replay_speed_select",
+                )
+                st.session_state.replay_speed = selected_speed
+
+            if not snapshots:
+                st.warning("⚠️ 没有可用的快照数据，请确认采样间隔设置。")
+            else:
+                max_frame = len(snapshots) - 1
+                current_frame = st.session_state.replay_current_frame
+                current_frame = max(0, min(current_frame, max_frame))
+                st.session_state.replay_current_frame = current_frame
+
+                btn_col1, btn_col2, btn_col3, btn_col4, btn_col5 = st.columns(5)
+                with btn_col1:
+                    first_btn = st.button("⏮️ 第一帧", use_container_width=True)
+                with btn_col2:
+                    prev_btn = st.button("◀️ 上一帧", use_container_width=True)
+                with btn_col3:
+                    play_label = "⏸️ 暂停" if st.session_state.replay_playing else "▶️ 播放"
+                    play_btn = st.button(play_label, type="primary", use_container_width=True)
+                with btn_col4:
+                    next_btn = st.button("▶️ 下一帧", use_container_width=True)
+                with btn_col5:
+                    last_btn = st.button("⏭️ 最后一帧", use_container_width=True)
+
+                if first_btn:
+                    st.session_state.replay_current_frame = 0
+                    st.session_state.replay_playing = False
+                    st.rerun()
+                if prev_btn and current_frame > 0:
+                    st.session_state.replay_current_frame = current_frame - 1
+                    st.session_state.replay_playing = False
+                    st.rerun()
+                if play_btn:
+                    st.session_state.replay_playing = not st.session_state.replay_playing
+                    st.rerun()
+                if next_btn and current_frame < max_frame:
+                    st.session_state.replay_current_frame = current_frame + 1
+                    st.session_state.replay_playing = False
+                    st.rerun()
+                if last_btn:
+                    st.session_state.replay_current_frame = max_frame
+                    st.session_state.replay_playing = False
+                    st.rerun()
+
+                frame = st.slider(
+                    "⏱️ 时间轴进度 (拖动到任意时刻)",
+                    min_value=0,
+                    max_value=max_frame,
+                    value=current_frame,
+                    key="replay_frame_slider",
+                )
+                if frame != st.session_state.replay_current_frame:
+                    st.session_state.replay_current_frame = frame
+                    st.session_state.replay_playing = False
+                    st.rerun()
+
+                snap = snapshots[st.session_state.replay_current_frame]
+
+                stat_c1, stat_c2, stat_c3, stat_c4 = st.columns(4)
+                with stat_c1:
+                    st.metric("当前时刻", _format_time(snap.timestamp))
+                with stat_c2:
+                    util = snap.zone_utilization.get(current_zone, 0.0)
+                    st.metric("分区利用率", f"{util:.1%}")
+                with stat_c3:
+                    zone_rtgs = snap.rtg_snapshots.get(current_zone, [])
+                    working_rtgs = len([r for r in zone_rtgs if r.status.value == "working"])
+                    st.metric("作业中场桥", f"{working_rtgs}/{len(zone_rtgs)}")
+                with stat_c4:
+                    st.metric("闸口排队", f"{snap.gate_queue_total} 辆")
+
+                fig_heatmap = replay_vis.create_static_heatmap_frame(snap, current_zone)
+                st.plotly_chart(fig_heatmap, use_container_width=True)
+
+                zone_cn = {"import": "进口区", "export": "出口区", "transit": "中转区"}.get(current_zone.value, current_zone.value)
+                with st.expander(f"📋 {zone_cn} 场桥详情", expanded=False):
+                    if zone_rtgs:
+                        rtg_rows = []
+                        for r in zone_rtgs:
+                            status_cn = {"idle": "空闲", "working": "作业中", "waiting": "等待让路"}[r.status.value]
+                            rtg_rows.append({
+                                "场桥ID": r.rtg_id,
+                                "当前贝位": f"Bay {r.current_bay}",
+                                "状态": status_cn,
+                            })
+                        st.table(rtg_rows)
+                    else:
+                        st.info("该区暂无场桥。")
+
+                with st.expander(f"🚦 各闸口排队详情", expanded=False):
+                    if snap.gate_queue_per_gate:
+                        gate_rows = []
+                        for gid, qlen in snap.gate_queue_per_gate.items():
+                            gate_rows.append({
+                                "闸口": gid.replace("gate_", "闸口 "),
+                                "排队车辆": qlen,
+                            })
+                        st.table(gate_rows)
+
+                st.markdown("---")
+
+                st.subheader("📋 诊断报告与优化建议")
+                report_generator = DiagnosisReportGenerator(events, snapshots, config)
+                report_text, suggestions = report_generator.generate_report()
+
+                st.markdown(report_text)
+
+                st.markdown("---")
+                st.subheader("💡 优化建议")
+                for i, sug in enumerate(suggestions, 1):
+                    st.markdown(f"{i}. {sug}")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from .stacking_strategies import StackingStrategy, create_strategy, BaseStacking
 from .container_generator import ContainerGenerator
 from .relocation import RelocationPlanner
 from .rtg_scheduler import RTGScheduler, RTG, RTGTask, TaskType
+from .replay_analysis import SnapshotRecorder
 
 
 class EventType(Enum):
@@ -91,6 +92,11 @@ class SimulationEngine:
         self._export_rng = random.Random(seed + 3000)
         self._np_rng = np.random.RandomState(seed + 2000)
 
+        self.snapshot_recorder = SnapshotRecorder(config)
+
+    def set_snapshot_interval(self, interval_minutes: float):
+        self.snapshot_recorder.set_sampling_interval(interval_minutes)
+
     def _init_rtgs(self):
         rtg_config = self.config.get("rtg", {})
         for zone in ZoneType:
@@ -135,9 +141,23 @@ class SimulationEngine:
         self.env.process(self._utilization_monitor())
         self.env.process(self._rtg_dispatcher())
         self.env.process(self._gate_queue_monitor())
+        self.env.process(self._snapshot_recorder_process())
 
         self.env.run(until=sim_duration_minutes)
         return self.stats
+
+    def _snapshot_recorder_process(self):
+        interval = self.snapshot_recorder.sampling_interval
+        while True:
+            yield self.env.timeout(interval)
+            self.snapshot_recorder.record(
+                timestamp=self.env.now,
+                yard=self.yard,
+                rtgs=self.rtgs,
+                rtg_resources=self.rtg_resources,
+                gate_resources=self.gate_resources,
+                rtg_pending_tasks=self.pending_tasks,
+            )
 
     def _gate_queue_monitor(self):
         interval = 5.0
