@@ -49,6 +49,34 @@ class BottleneckType(Enum):
     CONGESTION = "congestion"
     RTG_CONFLICT = "rtg_conflict"
     GATE_SATURATION = "gate_saturation"
+    CUSTOM_RULE = "custom_rule"
+
+
+class SeverityLevel(Enum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class CustomRuleConditionType(Enum):
+    ZONE_UTILIZATION = "zone_utilization"
+    RTG_WAIT_COUNT = "rtg_wait_count"
+    GATE_QUEUE_FLUCTUATION = "gate_queue_fluctuation"
+
+
+@dataclass
+class CustomRule:
+    rule_id: str
+    rule_name: str
+    condition_type: CustomRuleConditionType
+    zone: Optional[ZoneType] = None
+    rtg_id: Optional[str] = None
+    consecutive_snapshots: int = 3
+    threshold_pct: float = 0.85
+    wait_count_threshold: int = 5
+    fluctuation_threshold: int = 3
+    severity: SeverityLevel = SeverityLevel.MEDIUM
+    description: str = ""
 
 
 @dataclass
@@ -62,6 +90,20 @@ class BottleneckEvent:
     gate_id: Optional[str] = None
     peak_metric: float = 0.0
     description: str = ""
+    custom_rule_id: Optional[str] = None
+    custom_rule_name: Optional[str] = None
+    severity: Optional[SeverityLevel] = None
+
+
+@dataclass
+class HistoricalSimulationRecord:
+    record_id: str
+    label: str
+    timestamp: float
+    strategy_name: str
+    snapshots: List[YardSnapshot]
+    bottleneck_events: List[BottleneckEvent]
+    config_snapshot: Dict = field(default_factory=dict)
 
 
 class SnapshotRecorder:
@@ -170,10 +212,12 @@ class SnapshotRecorder:
 
 
 class BottleneckDiagnoser:
-    def __init__(self, snapshots: List[YardSnapshot], config: Dict):
+    def __init__(self, snapshots: List[YardSnapshot], config: Dict,
+                 custom_rules: Optional[List[CustomRule]] = None):
         self.snapshots = snapshots
         self.config = config
         self.events: List[BottleneckEvent] = []
+        self.custom_rules = custom_rules or []
 
         self.congestion_threshold = 0.80
         self.conflict_distance_threshold = 2
@@ -181,18 +225,163 @@ class BottleneckDiagnoser:
 
     def set_parameters(self, congestion_threshold: float = 0.80,
                        conflict_distance: int = 2,
-                       gate_saturation_ratio: float = 0.80):
+                       gate_saturation_ratio: float = 0.80,
+                       custom_rules: Optional[List[CustomRule]] = None):
         self.congestion_threshold = max(0.50, min(0.95, congestion_threshold))
         self.conflict_distance_threshold = max(1, min(10, conflict_distance))
         self.gate_saturation_ratio = max(0.50, min(0.95, gate_saturation_ratio))
+        if custom_rules is not None:
+            self.custom_rules = custom_rules
 
     def diagnose(self) -> List[BottleneckEvent]:
         self.events = []
         self._detect_congestion()
         self._detect_rtg_conflicts()
         self._detect_gate_saturation()
+        self._detect_custom_rules()
         self.events.sort(key=lambda e: e.start_time)
         return self.events
+
+    def _detect_custom_rules(self):
+        if not self.custom_rules:
+            return
+        for rule in self.custom_rules:
+            if rule.condition_type == CustomRuleConditionType.ZONE_UTILIZATION:
+                self._detect_rule_zone_utilization(rule)
+            elif rule.condition_type == CustomRuleConditionType.RTG_WAIT_COUNT:
+                self._detect_rule_rtg_wait(rule)
+            elif rule.condition_type == CustomRuleConditionType.GATE_QUEUE_FLUCTUATION:
+                self._detect_rule_gate_fluctuation(rule)
+
+    def _detect_rule_zone_utilization(self, rule: CustomRule):
+        zone = rule.zone
+        if not zone:
+            return
+        min_consecutive = max(1, rule.consecutive_snapshots)
+        zone_snaps = [(s.timestamp, s.zone_utilization.get(zone, 0.0)) for s in self.snapshots]
+        i = 0
+        while i < len(zone_snaps):
+            if zone_snaps[i][1] >= rule.threshold_pct:
+                start_idx = i
+                peak_util = zone_snaps[i][1]
+                while i < len(zone_snaps) and zone_snaps[i][1] >= rule.threshold_pct:
+                    peak_util = max(peak_util, zone_snaps[i][1])
+                    i += 1
+                count = i - start_idx
+                if count >= min_consecutive:
+                    start_time = zone_snaps[start_idx][0]
+                    end_time = zone_snaps[i - 1][0] if i - 1 >= 0 else start_time
+                    duration = end_time - start_time
+                    self.events.append(BottleneckEvent(
+                        event_type=BottleneckType.CUSTOM_RULE,
+                        start_time=start_time,
+                        end_time=end_time,
+                        duration=duration,
+                        zone=zone,
+                        peak_metric=peak_util,
+                        description=f"[自定义规则] {rule.rule_name}: {zone.value}区利用率连续{count}个快照超过{rule.threshold_pct:.0%}",
+                        custom_rule_id=rule.rule_id,
+                        custom_rule_name=rule.rule_name,
+                        severity=rule.severity,
+                    ))
+            else:
+                i += 1
+
+    def _detect_rule_rtg_wait(self, rule: CustomRule):
+        rtg_id = rule.rtg_id
+        min_snapshots = max(1, rule.consecutive_snapshots)
+        threshold = max(1, rule.wait_count_threshold)
+        rtg_snaps: List[Tuple[float, int, RTGStatus]] = []
+        for snap in self.snapshots:
+            found = False
+            for z, rtg_list in snap.rtg_snapshots.items():
+                for r in rtg_list:
+                    if r.rtg_id == rtg_id:
+                        wait_count = 1 if r.status == RTGStatus.WAITING else 0
+                        rtg_snaps.append((snap.timestamp, wait_count, r.status))
+                        found = True
+                        break
+                if found:
+                    break
+            if not found:
+                rtg_snaps.append((snap.timestamp, 0, RTGStatus.IDLE))
+        i = 0
+        while i < len(rtg_snaps):
+            window = rtg_snaps[i:i + min_snapshots]
+            total_wait = sum(w for _, w, _ in window)
+            if total_wait >= threshold and len(window) >= min_snapshots:
+                start_idx = i
+                peak_wait = total_wait
+                zone_info = None
+                while i < len(rtg_snaps):
+                    end_i = min(i + min_snapshots, len(rtg_snaps))
+                    cur_window = rtg_snaps[start_idx:end_i]
+                    cur_wait = sum(w for _, w, _ in cur_window)
+                    if cur_wait >= threshold:
+                        peak_wait = max(peak_wait, cur_wait)
+                        i += 1
+                    else:
+                        break
+                start_time = rtg_snaps[start_idx][0]
+                end_time = rtg_snaps[i - 1][0] if i - 1 >= 0 else start_time
+                duration = end_time - start_time
+                self.events.append(BottleneckEvent(
+                    event_type=BottleneckType.CUSTOM_RULE,
+                    start_time=start_time,
+                    end_time=end_time,
+                    duration=duration,
+                    rtg_ids=[rtg_id] if rtg_id else [],
+                    peak_metric=float(peak_wait),
+                    description=f"[自定义规则] {rule.rule_name}: 场桥{rtg_id}在窗口内等待次数达到{total_wait}次",
+                    custom_rule_id=rule.rule_id,
+                    custom_rule_name=rule.rule_name,
+                    severity=rule.severity,
+                ))
+            else:
+                i += 1
+
+    def _detect_rule_gate_fluctuation(self, rule: CustomRule):
+        threshold = max(1, rule.fluctuation_threshold)
+        gate_queues: List[Tuple[float, int]] = [(s.timestamp, s.gate_queue_total) for s in self.snapshots]
+        i = 0
+        min_snapshots = max(2, rule.consecutive_snapshots)
+        while i < len(gate_queues):
+            if i + min_snapshots <= len(gate_queues):
+                window = gate_queues[i:i + min_snapshots]
+                q_values = [q for _, q in window]
+                fluctuation = max(q_values) - min(q_values)
+                if fluctuation >= threshold:
+                    start_idx = i
+                    end_idx = i + min_snapshots - 1
+                    peak_fluc = fluctuation
+                    while i + min_snapshots <= len(gate_queues):
+                        cur_window = gate_queues[start_idx:i + min_snapshots]
+                        cur_q = [q for _, q in cur_window]
+                        cur_fluc = max(cur_q) - min(cur_q)
+                        if cur_fluc >= threshold:
+                            peak_fluc = max(peak_fluc, cur_fluc)
+                            end_idx = i + min_snapshots - 1
+                            i += 1
+                        else:
+                            break
+                    start_time = gate_queues[start_idx][0]
+                    end_time = gate_queues[end_idx][0]
+                    duration = end_time - start_time
+                    self.events.append(BottleneckEvent(
+                        event_type=BottleneckType.CUSTOM_RULE,
+                        start_time=start_time,
+                        end_time=end_time,
+                        duration=duration,
+                        peak_metric=float(peak_fluc),
+                        description=f"[自定义规则] {rule.rule_name}: 闸口总排队长度波动幅度达到{peak_fluc}辆",
+                        custom_rule_id=rule.rule_id,
+                        custom_rule_name=rule.rule_name,
+                        severity=rule.severity,
+                    ))
+                else:
+                    i += 1
+            else:
+                i += 1
 
     def _detect_congestion(self):
         min_consecutive = 3
@@ -367,6 +556,8 @@ class ReplayVisualizer:
                     return "🟠"
                 elif e.event_type == BottleneckType.GATE_SATURATION:
                     return "🟡"
+                elif e.event_type == BottleneckType.CUSTOM_RULE:
+                    return "🟣"
         return "  "
 
     def create_heatmap_animation(self, snapshots: List[YardSnapshot], zone: ZoneType,
@@ -405,11 +596,13 @@ class ReplayVisualizer:
             BottleneckType.CONGESTION: "#e74c3c",
             BottleneckType.RTG_CONFLICT: "#f39c12",
             BottleneckType.GATE_SATURATION: "#f1c40f",
+            BottleneckType.CUSTOM_RULE: "#8e44ad",
         }
         label_map = {
             BottleneckType.CONGESTION: "拥堵",
             BottleneckType.RTG_CONFLICT: "场桥冲突",
             BottleneckType.GATE_SATURATION: "闸口饱和",
+            BottleneckType.CUSTOM_RULE: "自定义规则",
         }
 
         fig = go.Figure()
@@ -575,7 +768,7 @@ class ReplayVisualizer:
         fig.update_layout(
             height=620,
             title=f"{zone.value.capitalize()}区 热力动态回放  "
-                  f"(🔴=拥堵  🟠=场桥冲突  🟡=闸口饱和预警  ⬜=正常)",
+                  f"(🔴=拥堵  🟠=场桥冲突  🟡=闸口饱和预警  🟣=自定义规则  ⬜=正常)",
             xaxis_title="贝位 (Bay)",
             yaxis_title="排 (Row)",
             legend=dict(
@@ -706,12 +899,14 @@ class ReplayVisualizer:
             BottleneckType.CONGESTION: "#e74c3c",
             BottleneckType.RTG_CONFLICT: "#f39c12",
             BottleneckType.GATE_SATURATION: "#f1c40f",
+            BottleneckType.CUSTOM_RULE: "#8e44ad",
         }
         anns = []
         y_positions = {
             BottleneckType.CONGESTION: 0.02,
             BottleneckType.RTG_CONFLICT: 0.06,
             BottleneckType.GATE_SATURATION: 0.10,
+            BottleneckType.CUSTOM_RULE: 0.14,
         }
         active_labels = []
         for e in events:
@@ -723,6 +918,9 @@ class ReplayVisualizer:
                     active_labels.append(f"🟠 场桥冲突")
                 elif e.event_type == BottleneckType.GATE_SATURATION:
                     active_labels.append(f"🟡 闸口饱和")
+                elif e.event_type == BottleneckType.CUSTOM_RULE:
+                    rn = e.custom_rule_name or "自定义规则"
+                    active_labels.append(f"🟣 {rn}")
         if active_labels:
             anns.append(dict(
                 x=0.01, y=0.98,
@@ -854,27 +1052,35 @@ class ReplayVisualizer:
             BottleneckType.CONGESTION: "#e74c3c",
             BottleneckType.RTG_CONFLICT: "#f39c12",
             BottleneckType.GATE_SATURATION: "#f1c40f",
+            BottleneckType.CUSTOM_RULE: "#8e44ad",
         }
         label_map = {
             BottleneckType.CONGESTION: "拥堵",
             BottleneckType.RTG_CONFLICT: "场桥冲突",
             BottleneckType.GATE_SATURATION: "闸口饱和预警",
+            BottleneckType.CUSTOM_RULE: "自定义规则",
         }
 
         fig = go.Figure()
 
         y_positions = {
-            BottleneckType.CONGESTION: 2,
-            BottleneckType.RTG_CONFLICT: 1,
-            BottleneckType.GATE_SATURATION: 0,
+            BottleneckType.CONGESTION: 3,
+            BottleneckType.RTG_CONFLICT: 2,
+            BottleneckType.GATE_SATURATION: 1,
+            BottleneckType.CUSTOM_RULE: 0,
         }
 
         for event in events:
             y = y_positions.get(event.event_type, 1)
             color = color_map.get(event.event_type, "#95a5a6")
             label = label_map.get(event.event_type, event.event_type.value)
+            if event.event_type == BottleneckType.CUSTOM_RULE and event.custom_rule_name:
+                label = event.custom_rule_name
 
             hover = f"{event.description}<br>起止: {_format_time(event.start_time)} ~ {_format_time(event.end_time)}<br>时长: {_format_time(event.duration)}<br>峰值: {event.peak_metric:.2f}"
+            if event.severity:
+                sev_map = {SeverityLevel.HIGH: "高", SeverityLevel.MEDIUM: "中", SeverityLevel.LOW: "低"}
+                hover += f"<br>严重等级: {sev_map.get(event.severity, event.severity.value)}"
 
             fig.add_trace(go.Scatter(
                 x=[event.start_time, event.end_time, event.end_time, event.start_time],
@@ -891,18 +1097,18 @@ class ReplayVisualizer:
             ))
 
         fig.update_layout(
-            title="瓶颈事件时间轴 (红=拥堵, 橙=冲突, 黄=饱和预警)",
+            title="瓶颈事件时间轴 (红=拥堵, 橙=冲突, 黄=饱和预警, 紫=自定义规则)",
             xaxis=dict(
                 title="时间 (分钟)",
                 range=[0, total_duration],
             ),
             yaxis=dict(
                 tickmode="array",
-                tickvals=[2, 1, 0],
-                ticktext=["堆场拥堵", "场桥冲突", "闸口饱和"],
-                range=[-0.8, 2.8],
+                tickvals=[3, 2, 1, 0],
+                ticktext=["堆场拥堵", "场桥冲突", "闸口饱和", "自定义规则"],
+                range=[-0.8, 3.8],
             ),
-            height=250,
+            height=280,
             showlegend=False,
         )
 
@@ -979,6 +1185,7 @@ class DiagnosisReportGenerator:
         congestion_events = [e for e in self.events if e.event_type == BottleneckType.CONGESTION]
         conflict_events = [e for e in self.events if e.event_type == BottleneckType.RTG_CONFLICT]
         saturation_events = [e for e in self.events if e.event_type == BottleneckType.GATE_SATURATION]
+        custom_events = [e for e in self.events if e.event_type == BottleneckType.CUSTOM_RULE]
 
         lines = []
         lines.append("## 📋 瓶颈诊断报告")
@@ -987,12 +1194,13 @@ class DiagnosisReportGenerator:
         lines.append(f"- 🔴 堆场拥堵事件: **{len(congestion_events)}** 个")
         lines.append(f"- 🟠 场桥冲突事件: **{len(conflict_events)}** 个")
         lines.append(f"- 🟡 闸口饱和预警: **{len(saturation_events)}** 个")
+        lines.append(f"- 🟣 自定义规则触发: **{len(custom_events)}** 个")
         lines.append("")
 
         if not self.events:
             lines.append("### ✅ 仿真运行良好")
             lines.append("本次仿真未检测到显著的瓶颈事件，当前配置下堆场运行较为顺畅。")
-            return "\n".join(lines), self._generate_suggestions(congestion_events, conflict_events, saturation_events)
+            return "\n".join(lines), self._generate_suggestions(congestion_events, conflict_events, saturation_events, custom_events)
 
         lines.append("---")
         lines.append("### 🕒 按时间排序的瓶颈事件详情")
@@ -1003,18 +1211,26 @@ class DiagnosisReportGenerator:
                 BottleneckType.CONGESTION: "🔴",
                 BottleneckType.RTG_CONFLICT: "🟠",
                 BottleneckType.GATE_SATURATION: "🟡",
+                BottleneckType.CUSTOM_RULE: "🟣",
             }
             type_map = {
                 BottleneckType.CONGESTION: "堆场拥堵",
                 BottleneckType.RTG_CONFLICT: "场桥冲突",
                 BottleneckType.GATE_SATURATION: "闸口饱和预警",
+                BottleneckType.CUSTOM_RULE: "自定义规则",
             }
             icon = icon_map.get(event.event_type, "⚪")
             type_name = type_map.get(event.event_type, event.event_type.value)
+            if event.event_type == BottleneckType.CUSTOM_RULE and event.custom_rule_name:
+                type_name = f"自定义规则: {event.custom_rule_name}"
 
             lines.append(f"#### {idx}. {icon} {type_name}")
             lines.append(f"- **起止时间**: 第{_format_time(event.start_time)} ~ 第{_format_time(event.end_time)}")
             lines.append(f"- **持续时长**: {_format_time(event.duration)}")
+
+            if event.severity:
+                sev_map = {SeverityLevel.HIGH: "高", SeverityLevel.MEDIUM: "中", SeverityLevel.LOW: "低"}
+                lines.append(f"- **严重等级**: {sev_map.get(event.severity, event.severity.value)}")
 
             if event.zone:
                 zone_cn = {"import": "进口区", "export": "出口区", "transit": "中转区"}
@@ -1035,15 +1251,17 @@ class DiagnosisReportGenerator:
             lines.append(f"- **描述**: {event.description}")
             lines.append("")
 
-        suggestions = self._generate_suggestions(congestion_events, conflict_events, saturation_events)
+        suggestions = self._generate_suggestions(congestion_events, conflict_events, saturation_events, custom_events)
         return "\n".join(lines), suggestions
 
-    def _generate_suggestions(self, congestion_events, conflict_events, saturation_events) -> List[str]:
+    def _generate_suggestions(self, congestion_events, conflict_events, saturation_events, custom_events=None) -> List[str]:
         suggestions = []
+        custom_events = custom_events or []
 
         total_congestion_dur = sum(e.duration for e in congestion_events)
         total_conflict_dur = sum(e.duration for e in conflict_events)
         total_saturation_dur = sum(e.duration for e in saturation_events)
+        total_custom_dur = sum(e.duration for e in custom_events)
 
         if total_congestion_dur > 0:
             affected_zones = set(e.zone for e in congestion_events if e.zone)
@@ -1097,8 +1315,174 @@ class DiagnosisReportGenerator:
                 f"建议将闸口数量从{current_gates}个增至{current_gates + 1}~{current_gates + 2}个。"
             )
 
+        if total_custom_dur > 0:
+            high_sev = [e for e in custom_events if e.severity == SeverityLevel.HIGH]
+            med_sev = [e for e in custom_events if e.severity == SeverityLevel.MEDIUM]
+            suggestions.append(
+                f"🟣 **自定义规则告警**: 共触发{len(custom_events)}次自定义规则（高优先级{len(high_sev)}次，中优先级{len(med_sev)}次）。"
+                f"请根据规则定义逐一核查并制定改进措施。"
+            )
+            rule_names = list(dict.fromkeys([e.custom_rule_name or e.custom_rule_id for e in custom_events]))
+            if rule_names:
+                suggestions.append(f"   涉及规则: {'；'.join(rule_names)}。")
+
         if not suggestions:
             suggestions.append("✅ 当前配置下仿真运行状况良好，无需特别优化。")
             suggestions.append("💡 如需进一步提升，可考虑：微调堆垛策略、在高峰时段动态增开场桥作业。")
 
         return suggestions
+
+
+@dataclass
+class StructuralBottleneck:
+    zone: Optional[ZoneType]
+    event_type: BottleneckType
+    custom_rule_id: Optional[str]
+    custom_rule_name: Optional[str]
+    typical_start: float
+    typical_end: float
+    frequency: int
+    total_simulations: int
+    avg_duration: float
+    severity: Optional[SeverityLevel] = None
+
+
+class BottleneckPatternAnalyzer:
+    def __init__(self, history: List[HistoricalSimulationRecord], time_window_tolerance: float = 30.0,
+                 min_occurrences: int = 3):
+        self.history = history
+        self.time_window_tolerance = time_window_tolerance
+        self.min_occurrences = max(2, min_occurrences)
+        self.zone_cn = {"import": "进口区", "export": "出口区", "transit": "中转区"}
+
+    def _event_key(self, event: BottleneckEvent) -> Tuple:
+        zone_val = event.zone.value if event.zone else None
+        if event.event_type == BottleneckType.CUSTOM_RULE:
+            return (zone_val, BottleneckType.CUSTOM_RULE.value, event.custom_rule_id or event.custom_rule_name)
+        return (zone_val, event.event_type.value, None)
+
+    def analyze(self) -> List[StructuralBottleneck]:
+        if len(self.history) < self.min_occurrences:
+            return []
+
+        all_occurrences: Dict[Tuple, List[Tuple[int, BottleneckEvent]]] = {}
+        for sim_idx, record in enumerate(self.history):
+            for event in record.bottleneck_events:
+                key = self._event_key(event)
+                if key not in all_occurrences:
+                    all_occurrences[key] = []
+                all_occurrences[key].append((sim_idx, event))
+
+        structural: List[StructuralBottleneck] = []
+        total_sims = len(self.history)
+
+        for key, occurrences in all_occurrences.items():
+            if len(occurrences) < self.min_occurrences:
+                continue
+
+            unique_sims = list(set(sim_idx for sim_idx, _ in occurrences))
+            if len(unique_sims) < self.min_occurrences:
+                continue
+
+            occurrences.sort(key=lambda x: x[1].start_time)
+
+            clusters: List[List[BottleneckEvent]] = []
+            for sim_idx, event in occurrences:
+                placed = False
+                for cluster in clusters:
+                    cluster_centers = [e.start_time for e in cluster]
+                    cluster_center = sum(cluster_centers) / len(cluster_centers)
+                    if abs(event.start_time - cluster_center) <= self.time_window_tolerance:
+                        cluster.append(event)
+                        placed = True
+                        break
+                if not placed:
+                    clusters.append([event])
+
+            for cluster in clusters:
+                cluster_sims = set()
+                sim_to_event = {}
+                for ev in cluster:
+                    for sim_idx, occ_ev in occurrences:
+                        if occ_ev is ev:
+                            cluster_sims.add(sim_idx)
+                            sim_to_event[sim_idx] = ev
+                            break
+
+                if len(cluster_sims) < self.min_occurrences:
+                    continue
+
+                freq = len(cluster_sims)
+                avg_start = sum(e.start_time for e in cluster) / len(cluster)
+                avg_end = sum(e.end_time for e in cluster) / len(cluster)
+                avg_duration = sum(e.duration for e in cluster) / len(cluster)
+                zone = cluster[0].zone
+                ev_type = cluster[0].event_type
+                severity = cluster[0].severity
+                custom_rule_id = cluster[0].custom_rule_id
+                custom_rule_name = cluster[0].custom_rule_name
+
+                structural.append(StructuralBottleneck(
+                    zone=zone,
+                    event_type=ev_type,
+                    custom_rule_id=custom_rule_id,
+                    custom_rule_name=custom_rule_name,
+                    typical_start=avg_start,
+                    typical_end=avg_end,
+                    frequency=freq,
+                    total_simulations=total_sims,
+                    avg_duration=avg_duration,
+                    severity=severity,
+                ))
+
+        structural.sort(key=lambda x: (-x.frequency, x.typical_start))
+        return structural
+
+    def generate_suggestion(self, sb: StructuralBottleneck) -> str:
+        zone_name = self.zone_cn.get(sb.zone.value, sb.zone.value) if sb.zone else "堆场"
+        start_str = _format_time(sb.typical_start)
+        end_str = _format_time(sb.typical_end)
+        freq_ratio = f"{sb.frequency}/{sb.total_simulations}"
+
+        type_cn = {
+            BottleneckType.CONGESTION: "拥堵",
+            BottleneckType.RTG_CONFLICT: "场桥冲突",
+            BottleneckType.GATE_SATURATION: "闸口饱和预警",
+            BottleneckType.CUSTOM_RULE: f"自定义规则[{sb.custom_rule_name or sb.custom_rule_id}]",
+        }
+
+        type_name = type_cn.get(sb.event_type, sb.event_type.value)
+
+        base = f"{zone_name}在仿真第{start_str}-{end_str}时段反复出现{type_name}（{freq_ratio}次仿真均出现），属于结构性瓶颈。"
+
+        if sb.event_type == BottleneckType.CONGESTION:
+            return (f"📦 {base}"
+                    f"建议在该时段增派临时场桥或提前疏散库存，或考虑增加贝位数扩容。")
+        elif sb.event_type == BottleneckType.RTG_CONFLICT:
+            return (f"🏗️ {base}"
+                    f"建议优化场桥工作范围划分，避免在高峰时段让多台场桥集中于同一区域作业。")
+        elif sb.event_type == BottleneckType.GATE_SATURATION:
+            return (f"🚛 {base}"
+                    f"建议在该时段临时增开闸口车道，或通过预约系统分散集卡到达时间。")
+        elif sb.event_type == BottleneckType.CUSTOM_RULE:
+            sev_str = ""
+            if sb.severity:
+                sev_map = {SeverityLevel.HIGH: "高优先级", SeverityLevel.MEDIUM: "中优先级", SeverityLevel.LOW: "低优先级"}
+                sev_str = f"[{sev_map.get(sb.severity, sb.severity.value)}]"
+            return (f"🟣 {sev_str} {base}"
+                    f"请根据该自定义规则的业务含义，制定针对性优化措施。")
+        else:
+            return f"⚠️ {base}请根据实际情况评估优化方案。"
+
+
+def find_nearest_snapshot(snapshots: List[YardSnapshot], target_time: float) -> int:
+    if not snapshots:
+        return 0
+    best_idx = 0
+    best_diff = abs(snapshots[0].timestamp - target_time)
+    for i, s in enumerate(snapshots):
+        diff = abs(s.timestamp - target_time)
+        if diff < best_diff:
+            best_diff = diff
+            best_idx = i
+    return best_idx
